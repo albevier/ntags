@@ -310,7 +310,7 @@ class TagEditorTUI:
         
         # Calculate visible area
         y_start = 3
-        y_end = height - 3
+        y_end = height - 4
         visible_lines = y_end - y_start
         
         # Adjust scroll offset to keep current file visible
