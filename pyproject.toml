@@ -1,0 +1,14 @@
+[project]
+name = "ntags"
+version = "0.1.0"
+description = "ncurses audio file tag editor"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "mutagen>=1.47.0",
+]
+
+[dependency-groups]
+dev = [
+    "pyinstaller>=6.19.0",
+]
