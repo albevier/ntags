@@ -1,0 +1,54 @@
+name: build-binaries
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+
+      # Windows is intentionally not targeted — curses is not part of the
+      # Python stdlib there.
+      - name: Build, smoke-test, checksum
+        run: ./build.sh
+
+      - name: Prepare per-platform artifacts
+        run: |
+          asset="ntags-${{ runner.os }}-${{ runner.arch }}"
+          mv dist/ntags "dist/$asset"
+          cd dist
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "$asset" > "$asset-SHA256SUM"
+          else
+            shasum -a 256 "$asset" > "$asset-SHA256SUM"
+          fi
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ntags-${{ runner.os }}-${{ runner.arch }}
+          path: |
+            dist/ntags-${{ runner.os }}-${{ runner.arch }}
+            dist/ntags-${{ runner.os }}-${{ runner.arch }}-SHA256SUM
+          if-no-files-found: error
+
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/ntags-${{ runner.os }}-${{ runner.arch }}
+            dist/ntags-${{ runner.os }}-${{ runner.arch }}-SHA256SUM

@@ -49,6 +49,17 @@ Or install directly:
 pip install mutagen
 ```
 
+## Building a binary
+
+Run `./build.sh` to produce a self-contained executable in `dist/`. The script cleans
+stale artifacts, installs dependencies from the pinned `uv.lock`, runs PyInstaller
+(`ntags.spec`), smoke-tests the result (no args → usage, exit 1), and writes
+dist/SHA256SUMS.
+
+Pushing a `v*` tag builds macOS and Linux binaries automatically (GitHub Actions workflow
+in `.github/workflows/`) and attaches per-platform artifacts, with checksums, to the
+release.
+
 ## Usage
 
 ### Basic Usage
@@ -164,6 +175,7 @@ When multiple files are selected:
 
 - Built with Python's `curses` module (ncurses wrapper)
 - Uses `mutagen` library for audio tag manipulation
+- Tag data for selected files is preloaded in a background thread (a progress indicator is shown while loading)
 - Supports recursive directory scanning
 - UTF-8 encoding for text fields
 
