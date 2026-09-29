@@ -4,6 +4,8 @@ TagEditorTUI class - TUI interface for editing audio file tags
 """
 
 import curses
+import threading
+from collections import deque
 from pathlib import Path
 from typing import List, Dict, Optional
 
@@ -36,8 +38,77 @@ class TagEditorTUI:
         self.tag_fields = ['title', 'artist', 'albumartist', 'album', 'date', 'genre', 'tracknumber', 'discnumber', 'composer', 'comment']
         self.tag_labels = ['Title', 'Artist', 'Album Artist', 'Album', 'Date/Year', 'Genre', 'Track #', 'Disc #', 'Composer', 'Comment']
         
+        # Background tag preloading. The worker thread never touches curses;
+        # AudioFile objects are published to the cache only after being fully
+        # constructed, so the main thread never sees partially loaded files.
+        self._ui_lock = threading.Lock()
+        self._unloadable: set = set()  # Indices that failed to load
+        self._pending_field_edits: Dict[str, str] = {}  # Field edits announced before their file finished loading
+        self._preload_queue: deque = deque()  # Indices queued for the worker
+        self._preload_queued: set = set()  # Dedup guard for _preload_queue
+        self._preload_wakeup = threading.Event()
+        threading.Thread(target=self._preload_worker, name="tag-preloader", daemon=True).start()
+        
         # Load files
         self._load_files()
+    
+    def _tags_loading_in_progress(self) -> bool:
+        """True while selected files still need their tags loaded."""
+        if not self.selected_files:
+            return False
+        return any(idx not in self.loaded_audio_files and idx not in self._unloadable
+                   for idx in self.selected_files)
+    
+    def _preload_selection(self):
+        """Queue tag loading for all selected files in the background worker."""
+        with self._ui_lock:
+            for idx in self.selected_files:
+                if (idx not in self.loaded_audio_files and idx not in self._unloadable
+                        and idx not in self._preload_queued):
+                    self._preload_queued.add(idx)
+                    self._preload_queue.append(idx)
+        self._preload_wakeup.set()
+    
+    def _preload_worker(self):
+        """Load tags for selected files one at a time, off the UI thread."""
+        while True:
+            with self._ui_lock:
+                idx = self._preload_queue.popleft() if self._preload_queue else None
+                if idx is not None:
+                    self._preload_queued.discard(idx)
+            
+            if idx is None:
+                # Drop the flag first, then re-check for items enqueued
+                # between the pop and the clear, to avoid a lost wakeup
+                self._preload_wakeup.clear()
+                with self._ui_lock:
+                    if self._preload_queue:
+                        continue
+                self._preload_wakeup.wait()
+                continue
+            
+            # Skip entries the user deselected or that were loaded by the main thread
+            with self._ui_lock:
+                stale = (idx not in self.selected_files
+                         or idx in self.loaded_audio_files
+                         or idx in self._unloadable)
+            if stale:
+                continue
+            
+            try:
+                audio = AudioFile(self.files[idx])
+            except Exception:
+                audio = None
+            
+            with self._ui_lock:
+                if audio is not None:
+                    self.loaded_audio_files[idx] = audio
+                    # An edit confirmed before this file finished loading
+                    if idx in self.selected_files and self._pending_field_edits:
+                        for field, value in self._pending_field_edits.items():
+                            audio.tags[field] = value
+                else:
+                    self._unloadable.add(idx)
     
     def _load_files(self):
         """Load audio files from the given path"""
@@ -66,26 +137,30 @@ class TagEditorTUI:
             if self.current_file_index not in self.loaded_audio_files:
                 self.loaded_audio_files[self.current_file_index] = AudioFile(self.files[self.current_file_index])
             self.current_audio = self.loaded_audio_files[self.current_file_index]
+            self._unloadable.discard(self.current_file_index)
             self.error_message = ""
         except Exception as e:
+            self._unloadable.add(self.current_file_index)
             self.error_message = str(e)
             self.current_audio = None
     
-    def _get_merged_tags(self) -> Dict[str, str]:
-        """Get merged tags from all selected files. Returns tags with '*' for varying values."""
+    def _get_merged_tags(self) -> Optional[Dict[str, str]]:
+        """Get merged tags from all selected files. Returns tags with '*' for varying values.
+        
+        Returns None while the background preload has not resolved every
+        selected file yet, so callers can show progress instead of the
+        misleading partial values an incomplete merge would produce.
+        """
         if not self.selected_files:
             # No files selected, return current file's tags
             if self.current_audio:
                 return self.current_audio.tags.copy()
             return {}
         
-        # Load all selected files
+        # Files not loaded/unloadable yet are being loaded in the background
         for idx in self.selected_files:
-            if idx not in self.loaded_audio_files:
-                try:
-                    self.loaded_audio_files[idx] = AudioFile(self.files[idx])
-                except:
-                    pass  # Skip files that fail to load
+            if idx not in self.loaded_audio_files and idx not in self._unloadable:
+                return None  # Still loading
         
         # Merge tags
         merged_tags = {}
@@ -127,7 +202,12 @@ class TagEditorTUI:
         edit_buffer = ""
         
         while True:
-            stdscr.clear()
+            # Poll at 5Hz while tags load in the background; block otherwise
+            stdscr.timeout(200 if self._tags_loading_in_progress() else -1)
+            
+            # erase() lets ncurses diff against the previous frame and only
+            # send changed cells; clear() forces a slow full repaint on every key
+            stdscr.erase()
             height, width = stdscr.getmaxyx()
             
             # Draw header
@@ -178,11 +258,22 @@ class TagEditorTUI:
                 elif key == 10 or key == curses.KEY_ENTER:  # Enter
                     # Save the edited value to selected files or current file
                     if self.selected_files:
-                        # Apply to all selected files
-                        for idx in self.selected_files:
-                            if idx in self.loaded_audio_files:
-                                self.loaded_audio_files[idx].tags[self.tag_fields[self.editing_field]] = edit_buffer
-                        self.status_message = f"Field updated for {len(self.selected_files)} files (press 's' to save)"
+                        # Apply to all selected files; files still loading pick
+                        # the edit up when their background load completes
+                        field = self.tag_fields[self.editing_field]
+                        updated = 0
+                        with self._ui_lock:
+                            self._pending_field_edits[field] = edit_buffer
+                            for idx in self.selected_files:
+                                if idx in self.loaded_audio_files:
+                                    self.loaded_audio_files[idx].tags[field] = edit_buffer
+                                    updated += 1
+                        still_loading = len(self.selected_files) - updated
+                        if still_loading:
+                            self.status_message = (f"Field updated for {updated} file(s); "
+                                                   f"{still_loading} still loading and will be updated too")
+                        else:
+                            self.status_message = f"Field updated for {len(self.selected_files)} files (press 's' to save)"
                     elif self.current_audio:
                         self.current_audio.tags[self.tag_fields[self.editing_field]] = edit_buffer
                         self.status_message = "Field updated (press 's' to save to file)"
@@ -210,6 +301,9 @@ class TagEditorTUI:
                         else:
                             self.selected_files.add(self.current_file_index)
                             self.status_message = f"File selected ({len(self.selected_files)} selected)"
+                        # Pending edits were tied to the previous selection
+                        self._pending_field_edits.clear()
+                        self._preload_selection()
                 elif key == curses.KEY_UP or key == ord('k'):
                     if self.ui_mode == 'browser':
                         self.current_file_index = (self.current_file_index - 1) % len(self.files)
@@ -238,6 +332,9 @@ class TagEditorTUI:
                         # Get the current value to edit
                         if self.selected_files:
                             merged_tags = self._get_merged_tags()
+                            if merged_tags is None:
+                                self.status_message = "Still loading tags for selected files…"
+                                continue
                             current_value = merged_tags.get(self.tag_fields[self.editing_field], "")
                             # If value is '*', start with empty string
                             edit_buffer = "" if current_value == '*' else current_value
@@ -265,6 +362,10 @@ class TagEditorTUI:
                             self.status_message = f"Saved {saved_count} file(s) successfully!"
                         else:
                             self.status_message = f"Saved {saved_count}, failed {failed_count}"
+                        still_loading = sum(1 for idx in self.selected_files
+                                            if idx not in self.loaded_audio_files and idx not in self._unloadable)
+                        if still_loading:
+                            self.status_message += f" ({still_loading} still loading — press s again when done)"
                     elif self.current_audio:
                         try:
                             self.current_audio.save_tags(self.current_audio.tags)
@@ -275,15 +376,21 @@ class TagEditorTUI:
                     # Reload current file
                     if self.current_file_index in self.loaded_audio_files:
                         del self.loaded_audio_files[self.current_file_index]
+                    self._unloadable.discard(self.current_file_index)  # Allow a previously failed file to be retried
                     self._load_current_file()
                     self.status_message = "File reloaded"
                 elif key == ord('c'):
                     # Clear selection
                     self.selected_files.clear()
+                    # Pending edits were tied to the previous selection
+                    self._pending_field_edits.clear()
                     self.status_message = "Selection cleared"
                 elif key == ord('a'):
                     # Select all files
                     self.selected_files = set(range(len(self.files)))
+                    # Pending edits were tied to the previous selection
+                    self._pending_field_edits.clear()
+                    self._preload_selection()
                     self.status_message = f"Selected all {len(self.files)} files"
     
     def _draw_header(self, stdscr, width):
@@ -373,9 +480,23 @@ class TagEditorTUI:
         if self.selected_files:
             info = f"Editing {len(self.selected_files)} file(s)"
             stdscr.addstr(y, x_start, info[:available_width], curses.color_pair(2))
-            y += 1
-            stdscr.addstr(y, x_start, "* = varying values", curses.color_pair(6))
+            
             tags_to_show = self._get_merged_tags()
+            y += 1
+            if tags_to_show is None:
+                # Background preload still running; show progress, not partial values
+                done = sum(1 for idx in self.selected_files
+                           if idx in self.loaded_audio_files or idx in self._unloadable)
+                load_line = f"Loading tags… {done}/{len(self.selected_files)}"
+                if self._unloadable:
+                    load_line += f" ({len(self._unloadable)} unreadable)"
+                stdscr.addstr(y, x_start, load_line[:available_width], curses.color_pair(4))
+                return
+            
+            vary_line = "* = varying values"
+            if self._unloadable:
+                vary_line += f" ({len(self._unloadable)} unreadable)"
+            stdscr.addstr(y, x_start, vary_line[:available_width], curses.color_pair(6))
         elif self.current_audio:
             filename = self.files[self.current_file_index].name
             file_info = f"{filename}"
